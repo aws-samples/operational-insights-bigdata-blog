@@ -1,11 +1,6 @@
-## My Project
+## Operational Insights blog post
 
-TODO: Fill this README out!
-
-Be sure to:
-
-* Change the title in this README
-* Edit your repository description on GitHub
+Use this AWS CloudFormation template to complete the blog post Power Operational Insights with Amazon QuickSight
 
 ## Security
 
