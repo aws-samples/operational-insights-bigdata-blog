@@ -1,0 +1,609 @@
+AWSTemplateFormatVersion: 2010-09-09
+Parameters:
+  TransformationLambdaArn:
+    Type: String
+    Description: Deployed from https://console.aws.amazon.com/lambda/home#/create/function/configure/blueprint?blueprint=kinesis-firehose-cloudwatch-logs-processor
+    Default: arn:aws:lambda:REGION:ACCOUNT:function:NAME
+Resources:
+  InsightsLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: InsightsLogGroup
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 3fa47758-587c-45e7-a79a-658f6e20c5f9
+  InsightsLogStream:
+    Type: 'AWS::Logs::LogStream'
+    Properties:
+      LogGroupName: !Ref InsightsLogGroup
+      LogStreamName: InsightsLogStream
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: c606eb0f-f59e-44dd-b88a-324b3578dae4
+  InsightsLogsBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties: {}
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 73e1c669-8c76-40a4-8481-124593d2b2fd
+  InsightsSubscriptionFilter:
+    Type: 'AWS::Logs::SubscriptionFilter'
+    Properties:
+      LogGroupName: InsightsLogGroup
+      RoleArn: !GetAtt InsightsCWRole.Arn
+      DestinationArn: !GetAtt InsightsKFStream.Arn
+      FilterPattern: '" "'
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: a6ddc1de-64b4-4730-abaa-9753ba2b1cfd
+  InsightsCWRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/CloudWatchLogsFullAccess'
+      Policies:
+        - PolicyName: kfh
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - 'firehose:PutRecord'
+                  - 'firehose:PutRecordBatch'
+                Resource: !GetAtt InsightsKFStream.Arn
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - !Sub logs.${AWS::Region}.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+  InsisghtSubscriptionProcessorRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/CloudWatchLogsFullAccess'
+      Policies:
+        - PolicyName: s3
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                Resource: !Sub 
+                  - 'arn:aws:s3:::${BUCKETNAME}/*'
+                  - BUCKETNAME: !Ref InsightsLogsBucket
+        - PolicyName: lambda-transform
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                Resource: 
+                  - !Sub '${TransformationLambdaArn}:$LATEST'
+                  - !Sub '${TransformationLambdaArn}'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - firehose.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 3c03a3e8-162c-47b3-b611-aad427aee9ed
+  InsightLogGeneratorRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/CloudWatchLogsFullAccess'
+      Policies:
+        - PolicyName: cwlogs
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:PutLogEvents'
+                Resource: 'arn:aws:logs:*:*:log-group:InsightsLogGroup:log-stream:*'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 2bfda516-1e9c-42b3-a81e-c85d24af2e2f
+  InsightsTransformationFunctionPolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      Description: allows transformation function to interact with Firehose
+      Path: /
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'firehose:PutRecord'
+              - 'firehose:PutRecordBatch'
+            Resource: !GetAtt InsightsKFStream.Arn
+  InsightLogGenerator:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Timeout: 30
+      Runtime: nodejs12.x
+      Role: !GetAtt InsightLogGeneratorRole.Arn
+      Handler: index.handler
+      Code:
+        ZipFile: |
+          var AWS = require('aws-sdk');
+          exports.handler = async (event) => {
+              const message = "Hello this is a sample log"
+              var params = { logEvents: [], logGroupName: 'InsightsLogGroup', logStreamName: 'InsightsLogStream' };
+              var token = null
+              var myDate = new Date(Date.now())
+              myDate.setMinutes(myDate.getMinutes() - 3);
+              for(var j=1; j<=3; j++){
+                for(var i=1; i<=55; i++){
+                  myDate.setSeconds(myDate.getSeconds() + j*i);
+                  params.logEvents.push({ message: getLevel() + " - " + message, timestamp: myDate.getTime()})
+                }
+                if(token != null){params.sequenceToken = token}
+                var cloudwatchlogs = new AWS.CloudWatchLogs({apiVersion: '2014-03-28'});
+                try{
+                  var cwResponse = await cloudwatchlogs.putLogEvents(params).promise()
+                }catch(ex){
+                  if(ex.toString().indexOf("InvalidSequenceTokenException")!== -1){
+                    params.sequenceToken = ex.toString().substring(ex.toString().indexOf("The next expected sequenceToken is: ")+36)
+                    cwResponse = await cloudwatchlogs.putLogEvents(params).promise()
+                  }
+                }
+                token = cwResponse["nextSequenceToken"]
+                await snooze(1000);
+              }
+              return { body: 'Logs generated' };
+          };
+
+          const snooze = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+          function getLevel(){
+            var rand = Math.floor(Math.random() * (4 - 0)) + 0;
+            var levels = ["ERRR", "WARN", "INFO", "DEBG", "CRIT"]
+            return levels[rand];
+          }
+      Description: Generate sample logs
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: b5d1ed98-6cd1-4dbf-9186-65b1cac75edd
+  InsightsLogCrawler:
+    Type: 'AWS::Glue::Crawler'
+    Properties:
+      Role: !GetAtt InsightCrawlerRole.Arn
+      DatabaseName: !Ref InsightsGlueDatabase
+      Schedule:
+        ScheduleExpression: cron(10 * * * ? *)
+      Targets:
+        S3Targets:
+          - Path: !Sub 
+              - '${BUCKETNAME}/cwlogs/'
+              - BUCKETNAME: !Ref InsightsLogsBucket
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: cd66d42f-3419-49d0-a3ff-81e1ebb39d62
+  InsightCrawlerRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/CloudWatchLogsFullAccess'
+      Policies:
+        - PolicyName: s3
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                Resource: !Sub 
+                  - 'arn:aws:s3:::${BUCKETNAME}/*'
+                  - BUCKETNAME: !Ref InsightsLogsBucket
+              - Effect: Allow
+                Action:
+                  - 's3:ListBucket'
+                Resource: !Sub 
+                  - 'arn:aws:s3:::${BUCKETNAME}'
+                  - BUCKETNAME: !Ref InsightsLogsBucket
+        - PolicyName: glue
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'glue:GetDatabase'
+                  - 'glue:CreateTable'
+                  - 'glue:UpdateTable'
+                  - 'glue:GetTable'
+                  - 'glue:GetPartition'
+                  - 'glue:UpdatePartition'
+                  - 'glue:Partitions'
+                  - 'glue:BatchGetPartition'
+                  - 'glue:BatchCreatePartition'
+                Resource:
+                  - !Sub 
+                    - 'arn:aws:glue:*:${AWS::AccountId}:table/${GlueDB}/*'
+                    - GlueDB: !Ref InsightsGlueDatabase
+                  - !Sub 'arn:aws:glue:*:${AWS::AccountId}:catalog'
+                  - !Sub 
+                    - 'arn:aws:glue:*:${AWS::AccountId}:database/${GlueDB}'
+                    - GlueDB: !Ref InsightsGlueDatabase
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - glue.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 8eefaa51-e5fd-45ef-aadc-44281021c10c
+  InsightsGlueDatabase:
+    Type: 'AWS::Glue::Database'
+    Properties:
+      CatalogId: !Ref 'AWS::AccountId'
+      DatabaseInput:
+        Name: insightsdb
+        Description: Database for CloudWatch Logs processed with subscription filter
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 3c28db8a-c9e7-48c5-ab9d-29c3b3f5a24e
+  InsightsKFStream:
+    Type: 'AWS::KinesisFirehose::DeliveryStream'
+    Properties:
+      ExtendedS3DestinationConfiguration:
+        Prefix: cwlogs/
+        BucketARN: !Sub 
+          - 'arn:aws:s3:::${BUCKETNAME}'
+          - BUCKETNAME: !Ref InsightsLogsBucket
+        RoleARN: !GetAtt InsisghtSubscriptionProcessorRole.Arn
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Type: Lambda
+              Parameters: 
+                - ParameterName: LambdaArn
+                  ParameterValue: !Ref TransformationLambdaArn
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: b6c6610b-df75-42c5-a1da-02c8194fd9b4
+Metadata:
+  'AWS::CloudFormation::Designer':
+    73e1c669-8c76-40a4-8481-124593d2b2fd:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 450
+        'y': 210
+      z: 1
+      embeds: []
+    3fa47758-587c-45e7-a79a-658f6e20c5f9:
+      size:
+        width: 240
+        height: 150
+      position:
+        x: 60
+        'y': 90
+      z: 1
+      embeds:
+        - a6ddc1de-64b4-4730-abaa-9753ba2b1cfd
+        - c606eb0f-f59e-44dd-b88a-324b3578dae4
+    c606eb0f-f59e-44dd-b88a-324b3578dae4:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 90
+        'y': 150
+      z: 2
+      parent: 3fa47758-587c-45e7-a79a-658f6e20c5f9
+      embeds: []
+      iscontainedinside:
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+    a6ddc1de-64b4-4730-abaa-9753ba2b1cfd:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 210
+        'y': 150
+      z: 2
+      parent: 3fa47758-587c-45e7-a79a-658f6e20c5f9
+      embeds: []
+      iscontainedinside:
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+        - 3fa47758-587c-45e7-a79a-658f6e20c5f9
+    5fba4b80-388b-4236-9c97-e21efcf1f59e:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 580
+        'y': 380
+      z: 1
+      embeds: []
+      isassociatedwith:
+        - 3c03a3e8-162c-47b3-b611-aad427aee9ed
+    3c03a3e8-162c-47b3-b611-aad427aee9ed:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 290
+        'y': 390
+      z: 1
+      embeds: []
+    42336a4c-bb9f-46cf-a71c-1e67ce0a3492:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 330
+        'y': 210
+      z: 1
+      embeds: []
+    fcd5b579-5f26-4ab2-b625-d994102fbd7f:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 330
+        'y': 90
+      z: 1
+      embeds: []
+      isassociatedwith:
+        - 42336a4c-bb9f-46cf-a71c-1e67ce0a3492
+    2bfda516-1e9c-42b3-a81e-c85d24af2e2f:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 70
+        'y': 270
+      z: 1
+      embeds: []
+    45d72b8e-598f-439c-a6f4-4b0400bc6e00:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 210
+        'y': 270
+      z: 1
+      embeds: []
+      isassociatedwith:
+        - 2bfda516-1e9c-42b3-a81e-c85d24af2e2f
+    b5d1ed98-6cd1-4dbf-9186-65b1cac75edd:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: -30
+        'y': 270
+      z: 1
+      embeds: []
+    cd66d42f-3419-49d0-a3ff-81e1ebb39d62:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 500
+        'y': 130
+      z: 0
+      embeds: []
+    8eefaa51-e5fd-45ef-aadc-44281021c10c:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 630
+        'y': 120
+      z: 1
+      embeds: []
+    88b39bd8-b27f-442a-ac0c-2bf04506e4d5:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 750
+        'y': 120
+      z: 1
+      embeds: []
+      isassociatedwith:
+        - 8eefaa51-e5fd-45ef-aadc-44281021c10c
+    3c28db8a-c9e7-48c5-ab9d-29c3b3f5a24e:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 420
+        'y': 40
+      z: 0
+      embeds: []
+    b6c6610b-df75-42c5-a1da-02c8194fd9b4:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 390
+        'y': 300
+      z: 0
+      embeds: []
